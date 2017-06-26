@@ -11,7 +11,7 @@ def create_op(func, **placeholders):
 
     def f(**kwargs):
         feed_dict = {}
-        for argname, argvalue in kwargs.iteritems():
+        for argname, argvalue in kwargs.items():
             placeholder = placeholders[argname]
             feed_dict[placeholder] = argvalue
         return tf.get_default_session().run(op, feed_dict=feed_dict)
@@ -95,7 +95,7 @@ to_float32 = create_op(
 
 
 def load(path):
-    with open(path) as f:
+    with open(path, "rb") as f:
         contents = f.read()
         
     _, ext = os.path.splitext(path.lower())
