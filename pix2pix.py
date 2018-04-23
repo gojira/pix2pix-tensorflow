@@ -28,6 +28,7 @@ parser.add_argument("--trace_freq", type=int, default=0, help="trace execution e
 parser.add_argument("--display_freq", type=int, default=0, help="write current training images every display_freq steps")
 parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
 
+parser.add_argument("--separable_conv", action="store_true", help="use separable convolutions in the generator")
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
 parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
@@ -90,15 +91,29 @@ def augment(image, brightness):
     return rgb
 
 
-def conv(batch_input, out_channels, stride):
-    with tf.variable_scope("conv"):
-        in_channels = batch_input.get_shape()[3]
-        filter = tf.get_variable("filter", [4, 4, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
-        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
-        #     => [batch, out_height, out_width, out_channels]
-        padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
-        conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
-        return conv
+def discrim_conv(batch_input, out_channels, stride):
+    padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
+    return tf.layers.conv2d(padded_input, out_channels, kernel_size=4, strides=(stride, stride), padding="valid", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+
+
+def gen_conv(batch_input, out_channels):
+    # [batch, in_height, in_width, in_channels] => [batch, out_height, out_width, out_channels]
+    initializer = tf.random_normal_initializer(0, 0.02)
+    if a.separable_conv:
+        return tf.layers.separable_conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", depthwise_initializer=initializer, pointwise_initializer=initializer)
+    else:
+        return tf.layers.conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
+
+
+def gen_deconv(batch_input, out_channels):
+    # [batch, in_height, in_width, in_channels] => [batch, out_height, out_width, out_channels]
+    initializer = tf.random_normal_initializer(0, 0.02)
+    if a.separable_conv:
+        _b, h, w, _c = batch_input.shape
+        resized_input = tf.image.resize_images(batch_input, [h * 2, w * 2], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        return tf.layers.separable_conv2d(resized_input, out_channels, kernel_size=4, strides=(1, 1), padding="same", depthwise_initializer=initializer, pointwise_initializer=initializer)
+    else:
+        return tf.layers.conv2d_transpose(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
 
 
 def lrelu(x, a):
@@ -113,28 +128,8 @@ def lrelu(x, a):
         return (0.5 * (1 + a)) * x + (0.5 * (1 - a)) * tf.abs(x)
 
 
-def batchnorm(input):
-    with tf.variable_scope("batchnorm"):
-        # this block looks like it has 3 inputs on the graph unless we do this
-        input = tf.identity(input)
-
-        channels = input.get_shape()[3]
-        offset = tf.get_variable("offset", [channels], dtype=tf.float32, initializer=tf.zeros_initializer())
-        scale = tf.get_variable("scale", [channels], dtype=tf.float32, initializer=tf.random_normal_initializer(1.0, 0.02))
-        mean, variance = tf.nn.moments(input, axes=[0, 1, 2], keep_dims=False)
-        variance_epsilon = 1e-5
-        normalized = tf.nn.batch_normalization(input, mean, variance, offset, scale, variance_epsilon=variance_epsilon)
-        return normalized
-
-
-def deconv(batch_input, out_channels):
-    with tf.variable_scope("deconv"):
-        batch, in_height, in_width, in_channels = [int(d) for d in batch_input.get_shape()]
-        filter = tf.get_variable("filter", [4, 4, out_channels, in_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
-        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, out_channels, in_channels]
-        #     => [batch, out_height, out_width, out_channels]
-        conv = tf.nn.conv2d_transpose(batch_input, filter, [batch, in_height * 2, in_width * 2, out_channels], [1, 2, 2, 1], padding="SAME")
-        return conv
+def batchnorm(inputs):
+    return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
 
 
 def check_image(image):
@@ -333,7 +328,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
-        output = conv(generator_inputs, a.ngf, stride=2)
+        output = gen_conv(generator_inputs, a.ngf)
         layers.append(output)
 
     layer_specs = [
@@ -350,7 +345,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
         with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
             rectified = lrelu(layers[-1], 0.2)
             # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
-            convolved = conv(rectified, out_channels, stride=2)
+            convolved = gen_conv(rectified, out_channels)
             output = batchnorm(convolved)
             layers.append(output)
 
@@ -377,7 +372,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
             rectified = tf.nn.relu(input)
             # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
-            output = deconv(rectified, out_channels)
+            output = gen_deconv(rectified, out_channels)
             output = batchnorm(output)
 
             if dropout > 0.0:
@@ -389,7 +384,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
     with tf.variable_scope("decoder_1"):
         input = tf.concat([layers[-1], layers[0]], axis=3)
         rectified = tf.nn.relu(input)
-        output = deconv(rectified, generator_outputs_channels)
+        output = gen_deconv(rectified, generator_outputs_channels)
         output = tf.tanh(output)
         layers.append(output)
 
@@ -406,7 +401,7 @@ def create_model(inputs, targets):
 
         # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
         with tf.variable_scope("layer_1"):
-            convolved = conv(input, a.ndf, stride=2)
+            convolved = discrim_conv(input, a.ndf, stride=2)
             rectified = lrelu(convolved, 0.2)
             layers.append(rectified)
 
@@ -417,20 +412,20 @@ def create_model(inputs, targets):
             with tf.variable_scope("layer_%d" % (len(layers) + 1)):
                 out_channels = a.ndf * min(2**(i+1), 8)
                 stride = 1 if i == n_layers - 1 else 2  # last layer here has stride 1
-                convolved = conv(layers[-1], out_channels, stride=stride)
+                convolved = discrim_conv(layers[-1], out_channels, stride=stride)
                 normalized = batchnorm(convolved)
                 rectified = lrelu(normalized, 0.2)
                 layers.append(rectified)
 
         # layer_5: [batch, 31, 31, ndf * 8] => [batch, 30, 30, 1]
         with tf.variable_scope("layer_%d" % (len(layers) + 1)):
-            convolved = conv(rectified, out_channels=1, stride=1)
+            convolved = discrim_conv(rectified, out_channels=1, stride=1)
             output = tf.sigmoid(convolved)
             layers.append(output)
 
         return layers[-1]
 
-    with tf.variable_scope("generator") as scope:
+    with tf.variable_scope("generator"):
         out_channels = int(targets.get_shape()[-1])
         outputs = create_generator(inputs, out_channels)
 
@@ -475,7 +470,7 @@ def create_model(inputs, targets):
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
     update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
 
-    global_step = tf.contrib.framework.get_or_create_global_step()
+    global_step = tf.train.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step+1)
 
     return Model(
@@ -539,9 +534,6 @@ def append_index(filesets, step=False):
 
 
 def main():
-    if tf.__version__.split('.')[0] != "1":
-        raise Exception("Tensorflow version 1 required")
-
     if a.seed is None:
         a.seed = random.randint(0, 2**31 - 1)
 
@@ -734,6 +726,7 @@ def main():
         if a.mode == "test":
             # testing
             # at most, process the test data once
+            start = time.time()
             max_steps = min(examples.steps_per_epoch, max_steps)
             for step in range(max_steps):
                 results = sess.run(display_fetches)
@@ -741,8 +734,8 @@ def main():
                 for i, f in enumerate(filesets):
                     print("evaluated image", f["name"])
                 index_path = append_index(filesets)
-
             print("wrote index at", index_path)
+            print("rate", (time.time() - start) / max_steps)
         else:
             # training
             start = time.time()
